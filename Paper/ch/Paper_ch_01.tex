@@ -42,4 +42,113 @@ T_i=\prod_{j<i}(1-\alpha_j),
 \end{equation}
 $\rho$ 越大表示寿命相对周期更长、越趋近静止；当 $v=0$ 且 $\rho\to\infty$ 时，PVG 退化回标准 3DGS。由此，静态/动态以统一参数化出现，仅通过 $\{v,\beta,l,\tau\}$ 的取值加以区分。PVG 以最小改动继承了 3DGS 的高效与可扩展性，同时补足了动态建模与可编辑性，是本文面向道路环境的更合适表征选择。
 
+\subsection{2D-4D 语义蒸馏}
+
+为解决仅凭重建损失难以稳定区分“相机运动”与“真实世界运动”的问题，并让模型更好地理解场景语义，我们将 2D 基础模型的稠密语义特征迁移至 4D 高斯表征，使每个高斯点元学习到连续可度量的语义向量，便于在后续构造语义先验与动静掩码。该范式已在 3DGS/4DGS 框架中验证有效，本文将其无缝引入 PVG 框架。
+
+我们采用 LSeg 作为教师模型。其像素特征与 CLIP 文本空间对齐，能够提供连续可度量、开放词汇的语义向量。对时刻 $t$ 的真帧 $I_t$ 提取像素对齐的教师特征图
+\[
+F_t=\mathrm{LSeg}(I_t).
+\]
+
+对学生端，我们为每个高斯基元赋予可学习语义向量 $f_{\text{sem},i}$。与 RGB 渲染完全一致，像素 $\mathbf p$ 处的学生语义由可见性 $\alpha$ 合成权重进行加权聚合；记 $\mathcal V(\mathbf p,t)$ 为按深度排序的可见点元集合、$w_i(\mathbf p,t)$ 为对应的 $\alpha$-合成权重，则
+\begin{equation}
+F_s(\mathbf p,t)=\sum_{i\in\mathcal V(\mathbf p,t)} w_i(\mathbf p,t)\,f_{\text{sem},i}.
+\label{eq:feature_render}
+\end{equation}
+为与教师通道数对齐，我们使用轻量线性头（$1{\times}1$ 卷积/全连接） $U(\cdot)$ 将学生输出映射到教师维度：
+\[
+\tilde F_s(\mathbf p,t)=U\!\big(F_s(\mathbf p,t)\big).
+\]
+
+我们采用像素级 $L_1$ 蒸馏使学生贴近教师，构建蒸馏损失
+\[
+\mathcal{L}_{\mathrm{SD}}
+=\frac{1}{|\Omega|}\sum_{\mathbf p\in\Omega}\left\|\tilde F_s(\mathbf p,t)-F_t(\mathbf p)\right\|_1,
+\]
+其中 $\Omega$ 为当前分辨率下的像素集合。训练收敛后，参与该像素合成的高斯会将教师语义“写入”其 $f_{\mathrm{sem}}$，形成可在时序上随 PVG 形变进行搬运的 4D 语义表征。与语义先验及双线索动静掩码的融合将于 §3.3 详述。
+
+\subsection{双线索动态掩码（Dual-Evidence Motion Mask)}
+在 §3.2 中，我们已获得教师的像素语义特征 $F_t$ 与学生侧的语义渲染 $\tilde F_s$。本节在此基础上，基于两类证据构建帧级动静掩码：其一为\emph{教师—学生特征差异}，其二为\emph{语义先验}。前者刻画像素处的语义不一致性，后者提供先验上应静止的区域指示。两者经轻量融合得到稳定的静态掩码 $M_{\mathrm{stat}}$ 与动态掩码 $M_{\mathrm{dyn}}$，用于路由后续时间约束。
+
+\paragraph{(a) 教师—学生特征差异}
+当像素对应静态背景时，多帧观察通常指向同一世界点，学生的语义渲染应与教师特征一致；而当像素位于动态目标或遮挡边界时，学生渲染更易与教师产生偏差。基于此，定义像素级余弦不相似度：
+\begin{equation}
+D(\mathbf p,t)=1-\cos\!\big(\tilde F_s(\mathbf p,t),\,F_t(\mathbf p)\big).
+\label{eq:demm_diff_simple}
+\end{equation}
+$D$ 越大，表示该像素更可能存在真实运动或配准不稳定。
+
+\paragraph{(b) 语义先验}
+利用 LSeg 的像素特征与文本原型得到类别分数 $\{S_k(\mathbf p,t)\}$，将静态倾向类（如 road/building/sky）累加为软静态先验：
+\begin{equation}
+M_{\mathrm{sem}}(\mathbf p,t)=\sum_{k\in\mathcal C_{\mathrm{stat}}} S_k(\mathbf p,t).
+\label{eq:demm_sem}
+\end{equation}
+
+\paragraph{(c) 轻量融合与阈值化}
+我们采用\emph{简单的的逻辑回归层}融合两条证据并输出静态概率 $\delta\in(0,1)$：
+\begin{equation}
+\delta(\mathbf p,t)=\sigma\!\big(a\cdot(1-D(\mathbf p,t))+b\cdot M_{\mathrm{sem}}(\mathbf p,t)+c\big),
+\label{eq:demm_delta_final}
+\end{equation}
+其中 $\sigma(\cdot)$ 为 Sigmoid，$a,b,c\in\mathbb{R}$ 为可学习标量（初始化 $a{=}1,b{=}1,c{=}0$），与主网络共同训练。训练期间，我们将 $\delta$ 作为\emph{软静态权重}直接参与后续时间约束（§3.4）的加权并采用固定阈值将其二值化：
+\begin{equation}
+M_{\mathrm{stat}}(\mathbf p,t)=\mathbf{1}\!\big(\delta(\mathbf p,t)>\tau_s\big),\qquad \tau_s=0.5,
+\label{eq:demm_binarize_final}
+\end{equation}
+并令 $M_{\mathrm{dyn}}(\mathbf p,t)=1-M_{\mathrm{stat}}(\mathbf p,t)$。此外，我们在实现中采用“保守融合”策略，即静态取并，动态取交，以进一步减小误差。
+
+\subsection{语义驱动的时间约束}
+为降低静态背景的伪运动并维持动态目标的时间连贯性，在不增加体渲复杂度的前提下，将“静区应近零速度、动区允许合理运动、跨时间保持稳定”的先验以可微方式注入模型。核心思路是：利用 §3.3 的像素级静态概率 $\delta(\mathbf p,t)$ 及其回投得到的点元级静态概率 $w_i^{\mathrm{stat}}$，在\emph{参数层}约束点元的速度与寿命（SVC/SLP）。
+
+\paragraph{语义速度约束（SVC）}
+以点元语义向量 $f_{\mathrm{sem},i}$ 产生速度门控并直接作用于 PVG 的速度基向量：
+\begin{equation}
+g_i=\sigma(\mathbf w_g^\top f_{\mathrm{sem},i}+b_g)\in(0,1),\qquad
+\bm{v}_i^{\mathrm{eff}}=g_i\,\bm{v}_i,
+\label{eq:svc_gate}
+\end{equation}
+随后以 $\bm{v}_i^{\mathrm{eff}}$ 替代 $\bm{v}_i$ 更新轨迹 $\bm{\mu}_i(t)$（其余渲染流程不变）。为度量残余运动，采用对称时间步 $\Delta$ 的投影位移并按与 RGB 相同的 $\alpha$-合成权重 $w_i(\mathbf p,t)$ 聚合得到像素速度图：
+\begin{equation}
+V(\mathbf p,t)=\sum_{i\in\mathcal V(\mathbf p,t)} w_i(\mathbf p,t)\,
+\big\|\Pi\!\big(\bm{\mu}_i(t+\Delta)\big)-\Pi\!\big(\bm{\mu}_i(t-\Delta)\big)\big\|_1 .
+\label{eq:vel_map}
+\end{equation}
+训练时不对 $\delta$ 二值化，而是将其作为软静态权重抑制静区速度：
+\begin{equation}
+\mathcal L_{v}=\operatorname{mean}_{\mathbf p\in\Omega}\!\big(\delta(\mathbf p,t)\cdot V(\mathbf p,t)\big).
+\label{eq:svc_loss}
+\end{equation}
+
+\paragraph{静态寿命先验（SLP）}
+仅限制瞬时速度仍可能在长序列中积累缓慢漂移。基于 PVG 的寿命尺度 $\beta_i$ 与周期长度 $l_i$ 定义静态度
+\begin{equation}
+\rho_i=\beta_i/l_i,
+\end{equation}
+并用 $w_i^{\mathrm{stat}}$ 对静态倾向更高的点元施加\emph{下界约束}：
+\begin{equation}
+\mathcal L_{\rho}=\sum_{i} w_i^{\mathrm{stat}}\,
+\max\!\big(0,\ \rho^\star-\rho_i\big),
+\label{eq:slp_loss}
+\end{equation}
+其中 $\rho^\star>0$ 为静态度下界超参数，控制“长寿命、低频摆动”的偏好强度；$\rho_i$ 越大表示该点更接近真正静止的表面。
+
+\subsection{优化（Optimization)}
+训练目标需要在“外观/几何重建、语义对齐、时间稳定”之间取得平衡。经验表明，若在几何尚未收敛时过早强化时间约束，容易引发训练抖动或把真实运动过度抑制。为此，我们采用\emph{温启动}策略：先以重建与语义蒸馏稳定外观与语义，再逐步注入时间约束的影响。本文中的重建项 $\mathcal L_{\mathrm{rgb}}$ 由像素级 $L_1$ 与 SSIM 的加权组合构成，用于驱动几何与外观的基础收敛而不额外引入假设。
+
+总体目标定义为
+\begin{equation}
+\mathcal L=\mathcal L_{\mathrm{rgb}}+\lambda_{\mathrm{SD}}\mathcal L_{\mathrm{SD}}
++\lambda_v \mathcal L_v+\lambda_\rho \mathcal L_\rho+\lambda_{\mathrm{reg}}\mathcal L_{\mathrm{reg}}.
+\label{eq:opt_total}
+\end{equation}
+其中 $\mathcal L_{\mathrm{SD}}$ 为 §3.2 的语义蒸馏损失，$\mathcal L_v$ 与 $\mathcal L_\rho$ 分别对应 §3.4 的语义速度约束与静态寿命先验，$\mathcal L_{\mathrm{reg}}$ 为轻量正则。为避免早期过度抑制动态与造成不稳定，权重采用分阶段调度：$\lambda_{\mathrm{SD}}{=}1.0$（常数）；$\lambda_v$ 在前 $5$k 次迭代由 $0$ 线性升至 $0.5$；$\rho^\star$ 在前 $15$k 次迭代由 $1.0$ 线性升至 $1.5$；$\lambda_\rho\equiv 0.15$（或在前 $2$k 次迭代从 $0$ 线性预热到 $0.15$）。
+
+为抑制语义向量与速度基过大波动，我们引入 $\ell_2$ 正则：
+\begin{equation}
+\mathcal L_{\mathrm{reg}}=\lambda_f\sum_i \|f_{\mathrm{sem},i}\|_2^2+\lambda_v^{\ell_2}\sum_i \|{\bm v}_i\|_2^2,
+\end{equation}
+默认 $\lambda_f{=}1\!\times\!10^{-4}$，$\lambda_v^{\ell_2}{=}5\!\times\!10^{-5}$。时间相关参数采用中性初始化以避免早期过抑制：${\bm v}_i{=}\bm{0}$、$l_i{=}1$、$\beta_i{=}1$；语义门控与动静融合器的线性参数初始化为零（$g_i\!\approx\!0.5,\ \delta\!\approx\!0.5$），随后与主网络端到端共同更新。
+
 \end{document}
